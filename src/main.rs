@@ -3,24 +3,27 @@ mod tui;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use diff::{ChangeKind, DiffResult, compute_diff};
+use diff::{ChangeKind, DiffOptions, DiffResult, compute_diff};
 use std::path::Path;
 
+/// 🍡 mochidetect — smart diff tool for comparing versions/projects
 #[derive(Parser, Debug)]
 #[command(
     name = "mochidetect",
-    version = "0.1.0",
+    version = "0.2.0",
     about = "Smart diff tool for comparing two project versions or directories",
     long_about = "\
 🍡 mochidetect — smart version diff\n\
 \n\
-Compare two directories, project versions, or files and see exactly what changed.\n\
-Launches an interactive TUI by default. Use --plain for plain terminal output.\n\
+Compare two directories, project versions, or files.\n\
+Launches an interactive TUI by default. Use --plain for plain output.\n\
 \n\
 Examples:\n\
   mochidetect ./v1 ./v2\n\
-  mochidetect old_project/ new_project/ --plain\n\
-  mochidetect file_a.py file_b.py"
+  mochidetect ./v1 ./v2 --plain\n\
+  mochidetect ./v1 ./v2 -I '*.lock' -I 'dist/**'\n\
+  mochidetect ./v1 ./v2 --gitignore\n\
+  mochidetect file_a.py file_b.py --plain"
 )]
 struct Cli {
     /// First path (old version)
@@ -29,11 +32,11 @@ struct Cli {
     /// Second path (new version)
     new: String,
 
-    /// Print plain output instead of TUI
+    /// Print plain output instead of launching the TUI
     #[arg(short, long)]
     plain: bool,
 
-    /// Show unchanged files too
+    /// Show unchanged files too (hidden by default)
     #[arg(short = 'a', long)]
     all: bool,
 
@@ -41,9 +44,17 @@ struct Cli {
     #[arg(short, long)]
     ext: Option<String>,
 
-    /// Summary only — no per-file listing
+    /// Summary only — counts, no file listing
     #[arg(short, long)]
     summary: bool,
+
+    /// Ignore glob patterns (repeatable): -I '*.lock' -I 'dist/**'
+    #[arg(short = 'I', long = "ignore", value_name = "PATTERN")]
+    ignore: Vec<String>,
+
+    /// Respect .gitignore / .ignore files found in the trees
+    #[arg(short, long)]
+    gitignore: bool,
 }
 
 fn main() -> Result<()> {
@@ -59,8 +70,13 @@ fn main() -> Result<()> {
         anyhow::bail!("Path does not exist: {}", cli.new);
     }
 
-    let result = compute_diff(old_path, new_path)
-        .with_context(|| format!("Failed to diff {} and {}", cli.old, cli.new))?;
+    let opts = DiffOptions {
+        ignore_patterns: cli.ignore.clone(),
+        use_gitignore: cli.gitignore,
+    };
+
+    let result = compute_diff(old_path, new_path, &opts)
+        .with_context(|| format!("Failed to diff '{}' and '{}'", cli.old, cli.new))?;
 
     if cli.plain || cli.summary {
         print_plain(&result, &cli);
@@ -93,13 +109,15 @@ fn print_plain(result: &DiffResult, cli: &Cli) {
     }
 
     for file in &result.files {
+        // Filter unchanged unless --all
+        if !cli.all && file.kind == ChangeKind::Unchanged {
+            continue;
+        }
+        // Extension filter
         if let Some(ref ext) = cli.ext {
             if file.extension() != ext.to_lowercase() {
                 continue;
             }
-        }
-        if !cli.all && file.kind == ChangeKind::Unchanged {
-            continue;
         }
 
         let sym = file.kind.symbol();
