@@ -1,6 +1,6 @@
 [package]
 name = "mochidetect"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Smart diff tool for comparing versions/projects (good for ai assisted development ;))"
 authors = ["gh-mochi-org", "idotconfig"]

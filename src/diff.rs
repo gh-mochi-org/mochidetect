@@ -102,6 +102,18 @@ impl DiffStats {
     }
 }
 
+// ─── Streaming update type ────────────────────────────────────────────────────
+
+/// Messages streamed from the background diff thread to the TUI.
+pub enum DiffUpdate {
+    /// A single file result — arrives as soon as it's known.
+    File(FileDiff),
+    /// All files have been processed. List is now complete.
+    Done,
+    /// A fatal error occurred.
+    Error(String),
+}
+
 // ─── Diff options ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default)]
@@ -114,21 +126,31 @@ pub struct DiffOptions {
 }
 
 impl DiffOptions {
-    /// Build a GlobSet from ignore_patterns.
-    /// Each entry is split on `|` and whitespace so users can pass either:
-    ///   -I '*.log'  -I '*.lock'      (multiple flags)
-    ///   -I '*.log|*.lock|dist/**'    (pipe-separated)
-    ///   -I '*.log *.lock'            (space-separated)
     pub fn build_globset(&self) -> Result<GlobSet> {
         let mut builder = GlobSetBuilder::new();
         for raw in &self.ignore_patterns {
-            // Split on `|` then whitespace, filter empty tokens
             for pat in raw
                 .split(['|', ' ', '\t'])
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
                 builder.add(Glob::new(pat)?);
+
+                // Auto-expand bare names (no `/` or `*`) so that e.g. "target"
+                // matches the directory itself AND everything inside it at any
+                // depth — same behaviour as .gitignore bare-name rules.
+                //
+                //   "target"  →  target/**      (contents of top-level target/)
+                //                **/target/**   (contents of nested target/)
+                //                **/target      (the dir node itself when nested)
+                //
+                // Patterns that already contain `/` or `*` are intentional glob
+                // expressions and are left untouched.
+                if !pat.contains('/') && !pat.contains('*') {
+                    builder.add(Glob::new(&format!("{}/**", pat))?);
+                    builder.add(Glob::new(&format!("**/{}/**", pat))?);
+                    builder.add(Glob::new(&format!("**/{}", pat))?);
+                }
             }
         }
         Ok(builder.build()?)
@@ -137,8 +159,7 @@ impl DiffOptions {
 
 // ─── Fast I/O helpers ─────────────────────────────────────────────────────────
 
-/// Peek at the first 512 bytes of a file to decide if it's binary.
-/// Way faster than reading the whole file — avoids MB of I/O just for detection.
+/// Peek at the first 512 bytes to decide if it's binary — fast, avoids MB of I/O.
 fn peek_binary(path: &Path) -> bool {
     let mut buf = [0u8; 512];
     match File::open(path) {
@@ -150,14 +171,12 @@ fn peek_binary(path: &Path) -> bool {
     }
 }
 
-/// Hash a file with SHA-256. Only called when we actually need to confirm
-/// whether two same-sized files differ — avoided entirely when sizes differ.
+/// SHA-256 hash a file in 64 KB chunks. Only called when sizes match.
 fn hash_file(path: &Path) -> String {
-    // Read in chunks to avoid one big allocation for huge files
     match File::open(path) {
         Ok(mut f) => {
             let mut hasher = Sha256::new();
-            let mut buf = [0u8; 65536]; // 64 KB chunks
+            let mut buf = [0u8; 65536];
             loop {
                 match f.read(&mut buf) {
                     Ok(0) => break,
@@ -178,13 +197,11 @@ fn is_always_skip(name: &str) -> bool {
 }
 
 /// Walk a directory tree and return relative_path → (absolute_path, size).
-/// Respects .gitignore when requested and applies user glob patterns.
 fn collect_files(
     root: &Path,
     opts: &DiffOptions,
     globs: &GlobSet,
 ) -> Result<HashMap<PathBuf, (PathBuf, u64)>> {
-    // Single-file shortcut — no walking needed
     if root.is_file() {
         let meta = fs::metadata(root)?;
         let filename = root.file_name().unwrap_or_default();
@@ -196,11 +213,11 @@ fn collect_files(
     let map: Arc<Mutex<HashMap<PathBuf, (PathBuf, u64)>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let walker = WalkBuilder::new(root)
-        .hidden(false) // we handle hidden ourselves
+        .hidden(false)
         .git_ignore(opts.use_gitignore)
         .git_global(false)
         .git_exclude(false)
-        .require_git(false) // .gitignore works outside git repos too
+        .require_git(false)
         .ignore(opts.use_gitignore)
         .follow_links(true)
         .threads(rayon::current_num_threads().min(8))
@@ -222,18 +239,38 @@ fn collect_files(
                 Err(_) => return WalkState::Continue,
             };
             let path = entry.path();
+            let is_dir  = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let is_file = entry.file_type().map(|t| t.is_file()).unwrap_or(false);
 
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if is_always_skip(name) {
-                    return WalkState::Skip;
+                    return WalkState::Skip; // prune .git/.hg/.svn trees
                 }
-                // Skip hidden (but not the root itself)
                 if name.starts_with('.') && path != root_ref {
-                    return WalkState::Continue;
+                    // Hidden dirs → prune whole subtree; hidden files → skip
+                    return if is_dir { WalkState::Skip } else { WalkState::Continue };
                 }
             }
 
-            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            // ── For directories: check globs and prune whole subtree if matched.
+            // This is what makes `-I target` as fast as find's -prune — we never
+            // descend into ignored directories at all.
+            if is_dir {
+                if let Ok(rel) = path.strip_prefix(&root_ref) {
+                    // Check relative path ("target", "src/target") or bare name
+                    if globs_ref.is_match(rel)
+                        || path
+                            .file_name()
+                            .map(|n| globs_ref.is_match(n))
+                            .unwrap_or(false)
+                    {
+                        return WalkState::Skip;
+                    }
+                }
+                return WalkState::Continue;
+            }
+
+            if !is_file {
                 return WalkState::Continue;
             }
 
@@ -242,7 +279,6 @@ fn collect_files(
                 Err(_) => return WalkState::Continue,
             };
 
-            // User glob patterns (already split/parsed in build_globset)
             if globs_ref.is_match(&rel) {
                 return WalkState::Continue;
             }
@@ -262,12 +298,11 @@ fn collect_files(
         .expect("mutex poisoned"))
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
+// ─── Synchronous API (used by --plain / --summary) ───────────────────────────
 
 pub fn compute_diff(old_root: &Path, new_root: &Path, opts: &DiffOptions) -> Result<DiffResult> {
     let globs = opts.build_globset()?;
 
-    // Collect both trees in parallel
     let (old_res, new_res) = rayon::join(
         || collect_files(old_root, opts, &globs),
         || collect_files(new_root, opts, &globs),
@@ -282,7 +317,6 @@ pub fn compute_diff(old_root: &Path, new_root: &Path, opts: &DiffOptions) -> Res
     let removed_keys: Vec<&PathBuf> = old_keys.difference(&new_keys).copied().collect();
     let common_keys: Vec<&PathBuf> = old_keys.intersection(&new_keys).copied().collect();
 
-    // Added — only need a binary peek, no hashing
     let added: Vec<FileDiff> = added_keys
         .par_iter()
         .map(|key| {
@@ -299,7 +333,6 @@ pub fn compute_diff(old_root: &Path, new_root: &Path, opts: &DiffOptions) -> Res
         })
         .collect();
 
-    // Removed — only need a binary peek, no hashing
     let removed: Vec<FileDiff> = removed_keys
         .par_iter()
         .map(|key| {
@@ -316,10 +349,6 @@ pub fn compute_diff(old_root: &Path, new_root: &Path, opts: &DiffOptions) -> Res
         })
         .collect();
 
-    // Common — three-stage fast path:
-    //   1. sizes differ  → immediately Modified, skip hashing entirely
-    //   2. sizes equal   → hash both sides to confirm
-    //   3. hashes equal  → Unchanged
     let common: Vec<FileDiff> = common_keys
         .par_iter()
         .map(|key| {
@@ -327,10 +356,8 @@ pub fn compute_diff(old_root: &Path, new_root: &Path, opts: &DiffOptions) -> Res
             let (new_path, new_size) = &new_files[*key];
 
             let kind = if old_size != new_size {
-                // Sizes differ → definitely modified, no I/O needed beyond what we have
                 ChangeKind::Modified
             } else {
-                // Sizes match → need to hash to be sure (identical size ≠ identical content)
                 let (old_hash, new_hash) =
                     rayon::join(|| hash_file(old_path), || hash_file(new_path));
                 if old_hash == new_hash {
@@ -340,7 +367,6 @@ pub fn compute_diff(old_root: &Path, new_root: &Path, opts: &DiffOptions) -> Res
                 }
             };
 
-            // Only peek binary for changed files — unchanged ones rarely need it in the UI
             let binary = if kind == ChangeKind::Unchanged {
                 false
             } else {
@@ -359,7 +385,6 @@ pub fn compute_diff(old_root: &Path, new_root: &Path, opts: &DiffOptions) -> Res
         })
         .collect();
 
-    // Stats
     let mut stats = DiffStats {
         added: added.len(),
         removed: removed.len(),
@@ -373,7 +398,6 @@ pub fn compute_diff(old_root: &Path, new_root: &Path, opts: &DiffOptions) -> Res
         }
     }
 
-    // Merge + sort: modified → added → removed → unchanged
     let mut files: Vec<FileDiff> = added.into_iter().chain(removed).chain(common).collect();
     files.sort_by(|a, b| {
         let order = |k: &ChangeKind| match k {
@@ -396,7 +420,144 @@ pub fn compute_diff(old_root: &Path, new_root: &Path, opts: &DiffOptions) -> Res
     })
 }
 
-// ─── Diff line rendering ──────────────────────────────────────────────────────
+// ─── Streaming / async API (used by TUI) ─────────────────────────────────────
+//
+// Strategy:
+//   1. Walk both trees in parallel (fast — just filesystem metadata, no I/O)
+//   2. Added/Removed are known immediately → sent right away
+//   3. Common files are hashed in parallel via rayon → each result sent the
+//      moment it's ready, so the TUI fills up live instead of all at once
+//
+// This means the TUI opens instantly, shows added/removed files within
+// milliseconds, and modified/unchanged trickle in as SHA-256 completes.
+
+pub fn compute_diff_async(
+    old_root: PathBuf,
+    new_root: PathBuf,
+    opts: DiffOptions,
+    tx: std::sync::mpsc::Sender<DiffUpdate>,
+) {
+    let globs = match opts.build_globset() {
+        Ok(g) => g,
+        Err(e) => {
+            tx.send(DiffUpdate::Error(e.to_string())).ok();
+            return;
+        }
+    };
+
+    // ── Phase 1: parallel filesystem walk (metadata only, very fast) ─────────
+    let (old_res, new_res) = rayon::join(
+        || collect_files(&old_root, &opts, &globs),
+        || collect_files(&new_root, &opts, &globs),
+    );
+
+    let old_files = match old_res {
+        Ok(m) => Arc::new(m),
+        Err(e) => {
+            tx.send(DiffUpdate::Error(e.to_string())).ok();
+            return;
+        }
+    };
+    let new_files = match new_res {
+        Ok(m) => Arc::new(m),
+        Err(e) => {
+            tx.send(DiffUpdate::Error(e.to_string())).ok();
+            return;
+        }
+    };
+
+    let old_set: HashSet<PathBuf> = old_files.keys().cloned().collect();
+    let new_set: HashSet<PathBuf> = new_files.keys().cloned().collect();
+
+    let added_keys: Vec<PathBuf> = new_set.difference(&old_set).cloned().collect();
+    let removed_keys: Vec<PathBuf> = old_set.difference(&new_set).cloned().collect();
+    let common_keys: Vec<PathBuf> = old_set.intersection(&new_set).cloned().collect();
+
+    // ── Phase 2: send Added immediately (no hashing needed) ──────────────────
+    for key in added_keys {
+        let (path, size) = &new_files[&key];
+        let file = FileDiff {
+            is_binary: peek_binary(path),
+            rel_path: key,
+            kind: ChangeKind::Added,
+            old_path: None,
+            new_path: Some(path.clone()),
+            old_size: None,
+            new_size: Some(*size),
+        };
+        if tx.send(DiffUpdate::File(file)).is_err() {
+            return; // TUI closed
+        }
+    }
+
+    // ── Phase 2: send Removed immediately (no hashing needed) ────────────────
+    for key in removed_keys {
+        let (path, size) = &old_files[&key];
+        let file = FileDiff {
+            is_binary: peek_binary(path),
+            rel_path: key,
+            kind: ChangeKind::Removed,
+            old_path: Some(path.clone()),
+            new_path: None,
+            old_size: Some(*size),
+            new_size: None,
+        };
+        if tx.send(DiffUpdate::File(file)).is_err() {
+            return;
+        }
+    }
+
+    // ── Phase 3: hash common files in parallel, stream each result live ───────
+    // Clone tx before for_each_with consumes it, so we can send Done afterward.
+    let tx_done = tx.clone();
+    let of = Arc::clone(&old_files);
+    let nf = Arc::clone(&new_files);
+
+    common_keys
+        .into_par_iter()
+        .for_each_with(tx, move |tx, key| {
+            let (old_path, old_size) = match of.get(&key) {
+                Some(v) => v,
+                None => return,
+            };
+            let (new_path, new_size) = match nf.get(&key) {
+                Some(v) => v,
+                None => return,
+            };
+
+            let kind = if old_size != new_size {
+                // Size mismatch → definitely modified, skip hashing entirely
+                ChangeKind::Modified
+            } else {
+                let old_hash = hash_file(old_path);
+                let new_hash = hash_file(new_path);
+                if old_hash == new_hash {
+                    ChangeKind::Unchanged
+                } else {
+                    ChangeKind::Modified
+                }
+            };
+
+            // Only peek binary for changed files — unchanged ones rarely need it
+            let binary = kind != ChangeKind::Unchanged && peek_binary(old_path);
+
+            tx.send(DiffUpdate::File(FileDiff {
+                rel_path: key,
+                kind,
+                old_path: Some(old_path.clone()),
+                new_path: Some(new_path.clone()),
+                is_binary: binary,
+                old_size: Some(*old_size),
+                new_size: Some(*new_size),
+            }))
+            .ok();
+        });
+
+    // All workers finished — signal done
+    tx_done.send(DiffUpdate::Done).ok();
+}
+
+// ─── Diff line rendering (lazy, reads from disk on demand) ───────────────────
 
 pub fn get_file_diff_lines(file: &FileDiff) -> Vec<DiffLine> {
     if file.is_binary {
@@ -543,3 +704,4 @@ fn build_diff_lines(old: &str, new: &str) -> Vec<DiffLine> {
 
     result
 }
+

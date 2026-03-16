@@ -3,14 +3,15 @@ mod tui;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use diff::{ChangeKind, DiffOptions, DiffResult, compute_diff};
+use diff::{ChangeKind, DiffOptions, DiffResult, compute_diff, compute_diff_async};
 use std::path::Path;
+use std::sync::mpsc;
 
 /// 🍡 mochidetect — smart diff tool for comparing versions/projects
 #[derive(Parser, Debug)]
 #[command(
     name = "mochidetect",
-    version = "0.2.0",
+    version = "0.1.1",
     about = "Smart diff tool for comparing two project versions or directories",
     long_about = "\
 🍡 mochidetect — smart version diff\n\
@@ -75,13 +76,25 @@ fn main() -> Result<()> {
         use_gitignore: cli.gitignore,
     };
 
-    let result = compute_diff(old_path, new_path, &opts)
-        .with_context(|| format!("Failed to diff '{}' and '{}'", cli.old, cli.new))?;
-
     if cli.plain || cli.summary {
+        // Plain mode: blocking diff then print — no TUI needed
+        let result = compute_diff(old_path, new_path, &opts)
+            .with_context(|| format!("Failed to diff '{}' and '{}'", cli.old, cli.new))?;
         print_plain(&result, &cli);
     } else {
-        tui::run_tui(result)?;
+        // TUI mode: open terminal immediately, diff runs in background thread,
+        // results stream into the UI as they arrive.
+        let (tx, rx) = mpsc::channel();
+        let old_owned = old_path.to_path_buf();
+        let new_owned = new_path.to_path_buf();
+        let old_str = cli.old.clone();
+        let new_str = cli.new.clone();
+
+        std::thread::spawn(move || {
+            compute_diff_async(old_owned, new_owned, opts, tx);
+        });
+
+        tui::run_tui(rx, old_str, new_str)?;
     }
 
     Ok(())
@@ -109,11 +122,9 @@ fn print_plain(result: &DiffResult, cli: &Cli) {
     }
 
     for file in &result.files {
-        // Filter unchanged unless --all
         if !cli.all && file.kind == ChangeKind::Unchanged {
             continue;
         }
-        // Extension filter
         if let Some(ref ext) = cli.ext {
             if file.extension() != ext.to_lowercase() {
                 continue;
@@ -139,3 +150,5 @@ fn print_plain(result: &DiffResult, cli: &Cli) {
 
     println!();
 }
+
+

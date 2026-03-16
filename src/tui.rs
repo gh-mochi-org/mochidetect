@@ -1,4 +1,6 @@
-use crate::diff::{ChangeKind, DiffLine, DiffResult, FileDiff, LineTag, get_file_diff_lines};
+use crate::diff::{
+    ChangeKind, DiffLine, DiffStats, DiffUpdate, FileDiff, LineTag, get_file_diff_lines,
+};
 use anyhow::Result;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
@@ -17,6 +19,8 @@ use ratatui::{
     },
 };
 use std::io;
+use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
 
 // ─── Palette ─────────────────────────────────────────────────────────────────
 const COLOR_ADDED: Color = Color::Rgb(80, 200, 120);
@@ -32,6 +36,8 @@ const COLOR_TEXT: Color = Color::Rgb(210, 218, 230);
 const COLOR_DIM: Color = Color::Rgb(90, 100, 115);
 const COLOR_SELECTED_BG: Color = Color::Rgb(35, 50, 75);
 
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 // ─── App state ────────────────────────────────────────────────────────────────
 
 #[derive(PartialEq)]
@@ -41,48 +47,156 @@ enum Focus {
 }
 
 pub struct App {
-    diff_result: DiffResult,
+    // Diff data — grows as results stream in
+    files: Vec<FileDiff>,
+    stats: DiffStats,
+    old_path: String,
+    new_path: String,
+
+    // Background thread channel
+    rx: Receiver<DiffUpdate>,
+    loading: bool,
+    tick: u8,
+
+    // UI state
     list_state: ListState,
     diff_lines: Vec<DiffLine>,
     diff_scroll: usize,
     focus: Focus,
-    /// When false (default), unchanged files are hidden
     show_unchanged: bool,
     search_query: String,
     search_mode: bool,
-    /// Indices into diff_result.files that pass the current filter
+    /// Indices into `files` that pass the current filter
     filtered_indices: Vec<usize>,
     status_msg: Option<String>,
     show_help: bool,
 }
 
 impl App {
-    pub fn new(diff_result: DiffResult) -> Self {
-        let mut app = App {
-            diff_result,
+    fn new(rx: Receiver<DiffUpdate>, old_path: String, new_path: String) -> Self {
+        App {
+            files: Vec::new(),
+            stats: DiffStats::default(),
+            old_path,
+            new_path,
+            rx,
+            loading: true,
+            tick: 0,
             list_state: ListState::default(),
             diff_lines: Vec::new(),
             diff_scroll: 0,
             focus: Focus::FileList,
-            show_unchanged: false, // ← changed-only by default
+            show_unchanged: false,
             search_query: String::new(),
             search_mode: false,
             filtered_indices: Vec::new(),
             status_msg: None,
             show_help: false,
-        };
-        app.rebuild_filter();
-        if !app.filtered_indices.is_empty() {
-            app.list_state.select(Some(0));
-            app.load_diff(0);
         }
-        app
+    }
+
+    // ── Channel drain ─────────────────────────────────────────────────────────
+
+    /// Pull all pending messages from the background thread.
+    /// Returns true if anything changed (so caller knows to redraw).
+    fn poll_updates(&mut self) -> bool {
+        let mut changed = false;
+        loop {
+            match self.rx.try_recv() {
+                Ok(DiffUpdate::File(file)) => {
+                    self.add_file(file);
+                    changed = true;
+                }
+                Ok(DiffUpdate::Done) => {
+                    self.loading = false;
+                    self.sort_and_rebuild();
+                    changed = true;
+                    break;
+                }
+                Ok(DiffUpdate::Error(e)) => {
+                    self.status_msg = Some(format!("⚠  {}", e));
+                    self.loading = false;
+                    changed = true;
+                    break;
+                }
+                Err(_) => break, // Empty or disconnected
+            }
+        }
+        changed
+    }
+
+    /// Add a single incoming FileDiff, update stats + filter incrementally.
+    fn add_file(&mut self, file: FileDiff) {
+        match file.kind {
+            ChangeKind::Added => self.stats.added += 1,
+            ChangeKind::Removed => self.stats.removed += 1,
+            ChangeKind::Modified => self.stats.modified += 1,
+            ChangeKind::Unchanged => self.stats.unchanged += 1,
+        }
+
+        let passes = self.file_passes_filter(&file);
+        let idx = self.files.len();
+        self.files.push(file);
+
+        if passes {
+            self.filtered_indices.push(idx);
+            // Auto-select and load diff for the very first visible file
+            if self.list_state.selected().is_none() {
+                self.list_state.select(Some(0));
+                self.load_diff_at(0);
+            }
+        }
+    }
+
+    // ── Sorting & filtering ───────────────────────────────────────────────────
+
+    /// Called once when Done arrives — sorts the list and rebuilds indices.
+    fn sort_and_rebuild(&mut self) {
+        // Remember what was selected so we can re-find it after sort
+        let sel_path: Option<PathBuf> = self
+            .list_state
+            .selected()
+            .and_then(|s| self.filtered_indices.get(s))
+            .and_then(|&i| self.files.get(i))
+            .map(|f| f.rel_path.clone());
+
+        self.files.sort_by(|a, b| {
+            let order = |k: &ChangeKind| match k {
+                ChangeKind::Modified => 0u8,
+                ChangeKind::Added => 1,
+                ChangeKind::Removed => 2,
+                ChangeKind::Unchanged => 3,
+            };
+            order(&a.kind)
+                .cmp(&order(&b.kind))
+                .then_with(|| a.rel_path.cmp(&b.rel_path))
+        });
+
+        self.rebuild_filter();
+
+        // Restore selection to same file (now at new position)
+        if let Some(ref path) = sel_path {
+            if let Some(pos) = self
+                .filtered_indices
+                .iter()
+                .position(|&i| self.files.get(i).map(|f| &f.rel_path) == Some(path))
+            {
+                self.list_state.select(Some(pos));
+                self.load_diff_at(pos);
+                return;
+            }
+        }
+
+        // Fallback: select first
+        if !self.filtered_indices.is_empty() && self.list_state.selected().is_none() {
+            self.list_state.select(Some(0));
+            self.load_diff_at(0);
+        }
     }
 
     fn rebuild_filter(&mut self) {
         let q = self.search_query.to_lowercase();
         self.filtered_indices = self
-            .diff_result
             .files
             .iter()
             .enumerate()
@@ -91,7 +205,11 @@ impl App {
                     return false;
                 }
                 if !q.is_empty() {
-                    return f.rel_path.to_string_lossy().to_lowercase().contains(&q);
+                    return f
+                        .rel_path
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .contains(&q);
                 }
                 true
             })
@@ -99,15 +217,32 @@ impl App {
             .collect();
     }
 
-    fn selected_file(&self) -> Option<&FileDiff> {
-        let sel = self.list_state.selected()?;
-        let idx = *self.filtered_indices.get(sel)?;
-        self.diff_result.files.get(idx)
+    fn file_passes_filter(&self, file: &FileDiff) -> bool {
+        if !self.show_unchanged && file.kind == ChangeKind::Unchanged {
+            return false;
+        }
+        if !self.search_query.is_empty() {
+            return file
+                .rel_path
+                .to_string_lossy()
+                .to_lowercase()
+                .contains(&self.search_query.to_lowercase());
+        }
+        true
     }
 
-    fn load_diff(&mut self, list_sel: usize) {
-        if let Some(&idx) = self.filtered_indices.get(list_sel) {
-            if let Some(file) = self.diff_result.files.get(idx) {
+    // ── Navigation ────────────────────────────────────────────────────────────
+
+    fn selected_file(&self) -> Option<&FileDiff> {
+        let sel = self.list_state.selected()?;
+        let &idx = self.filtered_indices.get(sel)?;
+        self.files.get(idx)
+    }
+
+    /// Load diff lines for the file at position `pos` in `filtered_indices`.
+    fn load_diff_at(&mut self, pos: usize) {
+        if let Some(&idx) = self.filtered_indices.get(pos) {
+            if let Some(file) = self.files.get(idx) {
                 self.diff_lines = get_file_diff_lines(file);
                 self.diff_scroll = 0;
             }
@@ -122,7 +257,7 @@ impl App {
         let cur = self.list_state.selected().unwrap_or(0) as i32;
         let next = (cur + delta).clamp(0, len as i32 - 1) as usize;
         self.list_state.select(Some(next));
-        self.load_diff(next);
+        self.load_diff_at(next);
     }
 
     fn scroll_diff(&mut self, delta: i32) {
@@ -132,7 +267,6 @@ impl App {
     }
 
     fn toggle_unchanged(&mut self) {
-        // Remember which real file index we were on
         let cur_idx = self
             .list_state
             .selected()
@@ -141,17 +275,16 @@ impl App {
         self.show_unchanged = !self.show_unchanged;
         self.rebuild_filter();
 
-        // Try to keep selection on same file
         if let Some(old_idx) = cur_idx {
             if let Some(new_pos) = self.filtered_indices.iter().position(|&i| i == old_idx) {
                 self.list_state.select(Some(new_pos));
             } else if !self.filtered_indices.is_empty() {
                 self.list_state.select(Some(0));
-                self.load_diff(0);
+                self.load_diff_at(0);
             }
         }
 
-        let s = &self.diff_result.stats;
+        let s = &self.stats;
         self.status_msg = Some(if self.show_unchanged {
             format!(
                 "Showing all {} files  (+{} added  -{} removed  ~{} modified  ={} unchanged)",
@@ -175,15 +308,25 @@ impl App {
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
-pub fn run_tui(diff_result: DiffResult) -> Result<()> {
+pub fn run_tui(rx: Receiver<DiffUpdate>, old_path: String, new_path: String) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let mut app = App::new(diff_result);
+
+    // App starts immediately in loading state — TUI is up before any I/O
+    let mut app = App::new(rx, old_path, new_path);
 
     loop {
+        // Drain background results before drawing (non-blocking)
+        app.poll_updates();
+
+        // Advance spinner while loading
+        if app.loading {
+            app.tick = app.tick.wrapping_add(1);
+        }
+
         terminal.draw(|f| draw(f, &mut app))?;
 
         if event::poll(std::time::Duration::from_millis(50))? {
@@ -197,7 +340,7 @@ pub fn run_tui(diff_result: DiffResult) -> Result<()> {
                             app.rebuild_filter();
                             if !app.filtered_indices.is_empty() {
                                 app.list_state.select(Some(0));
-                                app.load_diff(0);
+                                app.load_diff_at(0);
                             }
                         }
                         KeyCode::Enter => {
@@ -208,7 +351,7 @@ pub fn run_tui(diff_result: DiffResult) -> Result<()> {
                             app.rebuild_filter();
                             if !app.filtered_indices.is_empty() {
                                 app.list_state.select(Some(0));
-                                app.load_diff(0);
+                                app.load_diff_at(0);
                             }
                         }
                         KeyCode::Char(c) => {
@@ -216,7 +359,7 @@ pub fn run_tui(diff_result: DiffResult) -> Result<()> {
                             app.rebuild_filter();
                             if !app.filtered_indices.is_empty() {
                                 app.list_state.select(Some(0));
-                                app.load_diff(0);
+                                app.load_diff_at(0);
                             }
                         }
                         _ => {}
@@ -284,7 +427,7 @@ pub fn run_tui(diff_result: DiffResult) -> Result<()> {
                     KeyCode::Home | KeyCode::Char('g') => {
                         if app.focus == Focus::FileList {
                             app.list_state.select(Some(0));
-                            app.load_diff(0);
+                            app.load_diff_at(0);
                         } else {
                             app.diff_scroll = 0;
                         }
@@ -293,7 +436,7 @@ pub fn run_tui(diff_result: DiffResult) -> Result<()> {
                         if app.focus == Focus::FileList {
                             let last = app.filtered_indices.len().saturating_sub(1);
                             app.list_state.select(Some(last));
-                            app.load_diff(last);
+                            app.load_diff_at(last);
                         } else {
                             app.diff_scroll = app.diff_lines.len().saturating_sub(1);
                         }
@@ -355,64 +498,91 @@ fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
-    let s = &app.diff_result.stats;
+    let s = &app.stats;
 
-    // Build badges: unchanged shown differently based on toggle
-    let unch_style = if app.show_unchanged {
-        Style::default().fg(COLOR_UNCHANGED)
+    // Left side: title + paths (or spinner while loading)
+    let left_spans = if app.loading {
+        let spinner = SPINNER[(app.tick / 3) as usize % SPINNER.len()];
+        vec![
+            Span::styled(
+                " 🍡 mochidetect ",
+                Style::default()
+                    .fg(Color::Rgb(255, 200, 100))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("│ ", Style::default().fg(COLOR_BORDER)),
+            Span::styled(
+                &app.old_path,
+                Style::default().fg(Color::Rgb(180, 140, 220)),
+            ),
+            Span::styled("  →  ", Style::default().fg(COLOR_DIM)),
+            Span::styled(
+                &app.new_path,
+                Style::default().fg(Color::Rgb(120, 190, 240)),
+            ),
+            Span::styled("  │  ", Style::default().fg(COLOR_BORDER)),
+            Span::styled(
+                format!("{} scanning… ", spinner),
+                Style::default()
+                    .fg(Color::Rgb(130, 180, 230))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]
     } else {
-        Style::default().fg(COLOR_DIM)
+        let unch_style = if app.show_unchanged {
+            Style::default().fg(COLOR_UNCHANGED)
+        } else {
+            Style::default().fg(COLOR_DIM)
+        };
+        let unchanged_badge = if app.show_unchanged {
+            Span::styled(format!(" ={} ", s.unchanged), unch_style)
+        } else {
+            Span::styled(
+                format!(" ={} [u to show] ", s.unchanged),
+                unch_style.add_modifier(Modifier::DIM),
+            )
+        };
+        vec![
+            Span::styled(
+                " 🍡 mochidetect ",
+                Style::default()
+                    .fg(Color::Rgb(255, 200, 100))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("│ ", Style::default().fg(COLOR_BORDER)),
+            Span::styled(
+                &app.old_path,
+                Style::default().fg(Color::Rgb(180, 140, 220)),
+            ),
+            Span::styled("  →  ", Style::default().fg(COLOR_DIM)),
+            Span::styled(
+                &app.new_path,
+                Style::default().fg(Color::Rgb(120, 190, 240)),
+            ),
+            Span::styled("  │  ", Style::default().fg(COLOR_BORDER)),
+            Span::styled(
+                format!(" +{} ", s.added),
+                Style::default()
+                    .fg(COLOR_ADDED)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" -{} ", s.removed),
+                Style::default()
+                    .fg(COLOR_REMOVED)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" ~{} ", s.modified),
+                Style::default()
+                    .fg(COLOR_MODIFIED)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            unchanged_badge,
+        ]
     };
 
-    let unchanged_badge = if app.show_unchanged {
-        Span::styled(format!(" ={} ", s.unchanged), unch_style)
-    } else {
-        Span::styled(
-            format!(" ={} [u to show] ", s.unchanged),
-            unch_style.add_modifier(Modifier::DIM),
-        )
-    };
-
-    let spans = vec![
-        Span::styled(
-            " 🍡 mochidetect ",
-            Style::default()
-                .fg(Color::Rgb(255, 200, 100))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("│ ", Style::default().fg(COLOR_BORDER)),
-        Span::styled(
-            &app.diff_result.old_path,
-            Style::default().fg(Color::Rgb(180, 140, 220)),
-        ),
-        Span::styled("  →  ", Style::default().fg(COLOR_DIM)),
-        Span::styled(
-            &app.diff_result.new_path,
-            Style::default().fg(Color::Rgb(120, 190, 240)),
-        ),
-        Span::styled("  │  ", Style::default().fg(COLOR_BORDER)),
-        Span::styled(
-            format!(" +{} ", s.added),
-            Style::default()
-                .fg(COLOR_ADDED)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" -{} ", s.removed),
-            Style::default()
-                .fg(COLOR_REMOVED)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" ~{} ", s.modified),
-            Style::default()
-                .fg(COLOR_MODIFIED)
-                .add_modifier(Modifier::BOLD),
-        ),
-        unchanged_badge,
-    ];
-
-    let header = Paragraph::new(Line::from(spans)).block(
+    let header = Paragraph::new(Line::from(left_spans)).block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -425,11 +595,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::FileList;
-    let border_color = if focused {
-        COLOR_BORDER_FOCUSED
-    } else {
-        COLOR_BORDER
-    };
+    let border_color = if focused { COLOR_BORDER_FOCUSED } else { COLOR_BORDER };
 
     let title = if app.search_mode {
         format!(" Files  /{}█ ", app.search_query)
@@ -439,12 +605,13 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
             app.search_query,
             app.filtered_indices.len()
         )
+    } else if app.loading {
+        format!(
+            " Files ({}) … ",
+            app.filtered_indices.len()
+        )
     } else {
-        let suffix = if !app.show_unchanged {
-            " · changed only"
-        } else {
-            ""
-        };
+        let suffix = if !app.show_unchanged { " · changed only" } else { "" };
         format!(" Files ({}){}  ", app.filtered_indices.len(), suffix)
     };
 
@@ -452,7 +619,7 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
         .filtered_indices
         .iter()
         .map(|&idx| {
-            let file = &app.diff_result.files[idx];
+            let file = &app.files[idx];
             let (sym, color) = match file.kind {
                 ChangeKind::Added => ("+", COLOR_ADDED),
                 ChangeKind::Removed => ("-", COLOR_REMOVED),
@@ -502,38 +669,41 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_diff_view(f: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::DiffView;
-    let border_color = if focused {
-        COLOR_BORDER_FOCUSED
+    let border_color = if focused { COLOR_BORDER_FOCUSED } else { COLOR_BORDER };
+
+    let file_title = if app.loading && app.filtered_indices.is_empty() {
+        " Diff View — scanning… ".to_string()
     } else {
-        COLOR_BORDER
+        app.selected_file()
+            .map(|fi| {
+                format!(
+                    " {} {} {} ",
+                    fi.kind.symbol(),
+                    fi.rel_path.to_string_lossy(),
+                    fi.kind.label()
+                )
+            })
+            .unwrap_or_else(|| " Diff View ".to_string())
     };
 
-    let file_title = app
-        .selected_file()
-        .map(|fi| {
-            let kind_color_label = match fi.kind {
-                ChangeKind::Added => ("ADDED", COLOR_ADDED),
-                ChangeKind::Removed => ("REMOVED", COLOR_REMOVED),
-                ChangeKind::Modified => ("MODIFIED", COLOR_MODIFIED),
-                ChangeKind::Unchanged => ("UNCHANGED", COLOR_UNCHANGED),
-            };
-            format!(
-                " {} {} {} ",
-                fi.kind.symbol(),
-                fi.rel_path.to_string_lossy(),
-                kind_color_label.0
-            )
-        })
-        .unwrap_or_else(|| " Diff View ".to_string());
-
     let inner_h = area.height.saturating_sub(2) as usize;
-    let visible: Vec<Line> = app
-        .diff_lines
-        .iter()
-        .skip(app.diff_scroll)
-        .take(inner_h)
-        .map(render_diff_line)
-        .collect();
+
+    // While loading with nothing yet, show a hint
+    let visible: Vec<Line> = if app.loading && app.filtered_indices.is_empty() {
+        vec![Line::from(Span::styled(
+            "  Scanning…",
+            Style::default()
+                .fg(COLOR_HEADER)
+                .add_modifier(Modifier::ITALIC),
+        ))]
+    } else {
+        app.diff_lines
+            .iter()
+            .skip(app.diff_scroll)
+            .take(inner_h)
+            .map(render_diff_line)
+            .collect()
+    };
 
     let paragraph = Paragraph::new(Text::from(visible))
         .block(
@@ -549,7 +719,6 @@ fn draw_diff_view(f: &mut Frame, app: &App, area: Rect) {
 
     f.render_widget(paragraph, area);
 
-    // Scrollbar
     if app.diff_lines.len() > inner_h {
         let mut sb = ScrollbarState::new(app.diff_lines.len()).position(app.diff_scroll);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -633,6 +802,11 @@ fn render_diff_line(dl: &DiffLine) -> Line<'static> {
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let msg = if let Some(ref s) = app.status_msg {
         s.clone()
+    } else if app.loading {
+        format!(
+            " Scanning… ({} files found so far)  q Quit",
+            app.filtered_indices.len()
+        )
     } else if app.focus == Focus::FileList {
         " ↑↓/jk Navigate  Enter/Tab → Diff  / Search  u Toggle Unchanged  ? Help  q Quit"
             .to_string()
@@ -727,3 +901,5 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         overlay,
     );
 }
+
+

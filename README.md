@@ -17,12 +17,16 @@ cargo install --path .
 # Make sure ~/.cargo/bin is in your $PATH
 ```
 
+
 ### Or just run it locally:
 ```bash
 git clone https://github.com/gh-mochi-org/mochidetect
 cd mochidetect
 cargo run -- ./testing/v1 ./testing/v2
 ```
+
+> **im so lazy to add a release in github sorry also i had to manually add optimization this time </3 also there is a bug which i knnow how to fix but i dont want feel free to fix that and tbh 99.99% of the time you wouldnt use it so its useless anyways thanks**
+
 
 ### Or download a release *(when available)*:
 ```bash
