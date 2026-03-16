@@ -5,11 +5,12 @@ use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-// ─── Public types ────────────────────────────────────────────────────────────
+// ─── Public types ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChangeKind {
@@ -105,52 +106,85 @@ impl DiffStats {
 
 #[derive(Debug, Clone, Default)]
 pub struct DiffOptions {
-    /// Extra ignore patterns (glob-style, e.g. "*.log", "build/")
+    /// Extra ignore patterns — supports glob syntax and `|` separation.
+    /// e.g. "*.log", "dist/**", "*.log|*.lock|build/"
     pub ignore_patterns: Vec<String>,
     /// Whether to respect .gitignore / .ignore files
     pub use_gitignore: bool,
 }
 
 impl DiffOptions {
+    /// Build a GlobSet from ignore_patterns.
+    /// Each entry is split on `|` and whitespace so users can pass either:
+    ///   -I '*.log'  -I '*.lock'      (multiple flags)
+    ///   -I '*.log|*.lock|dist/**'    (pipe-separated)
+    ///   -I '*.log *.lock'            (space-separated)
     pub fn build_globset(&self) -> Result<GlobSet> {
         let mut builder = GlobSetBuilder::new();
-        for pat in &self.ignore_patterns {
-            builder.add(Glob::new(pat)?);
+        for raw in &self.ignore_patterns {
+            // Split on `|` then whitespace, filter empty tokens
+            for pat in raw
+                .split(['|', ' ', '\t'])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                builder.add(Glob::new(pat)?);
+            }
         }
         Ok(builder.build()?)
     }
 }
 
-// ─── Internals ────────────────────────────────────────────────────────────────
+// ─── Fast I/O helpers ─────────────────────────────────────────────────────────
 
+/// Peek at the first 512 bytes of a file to decide if it's binary.
+/// Way faster than reading the whole file — avoids MB of I/O just for detection.
+fn peek_binary(path: &Path) -> bool {
+    let mut buf = [0u8; 512];
+    match File::open(path) {
+        Ok(mut f) => {
+            let n = f.read(&mut buf).unwrap_or(0);
+            buf[..n].contains(&0)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Hash a file with SHA-256. Only called when we actually need to confirm
+/// whether two same-sized files differ — avoided entirely when sizes differ.
 fn hash_file(path: &Path) -> String {
-    match fs::read(path) {
-        Ok(bytes) => {
-            let mut h = Sha256::new();
-            h.update(&bytes);
-            hex::encode(h.finalize())
+    // Read in chunks to avoid one big allocation for huge files
+    match File::open(path) {
+        Ok(mut f) => {
+            let mut hasher = Sha256::new();
+            let mut buf = [0u8; 65536]; // 64 KB chunks
+            loop {
+                match f.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => hasher.update(&buf[..n]),
+                    Err(_) => return String::new(),
+                }
+            }
+            hex::encode(hasher.finalize())
         }
         Err(_) => String::new(),
     }
 }
 
-fn is_binary(bytes: &[u8]) -> bool {
-    bytes[..bytes.len().min(8000)].contains(&0)
-}
+// ─── File collection ──────────────────────────────────────────────────────────
 
-/// Classify a path component as always-skipped (regardless of gitignore).
 fn is_always_skip(name: &str) -> bool {
     matches!(name, ".git" | ".hg" | ".svn")
 }
 
-/// Walk a directory tree, respecting .gitignore when requested and applying
-/// user ignore patterns, returning a map of relative_path → (absolute_path, size).
+/// Walk a directory tree and return relative_path → (absolute_path, size).
+/// Respects .gitignore when requested and applies user glob patterns.
 fn collect_files(
     root: &Path,
     opts: &DiffOptions,
     globs: &GlobSet,
 ) -> Result<HashMap<PathBuf, (PathBuf, u64)>> {
-    // Single-file shortcut
+    // Single-file shortcut — no walking needed
     if root.is_file() {
         let meta = fs::metadata(root)?;
         let filename = root.file_name().unwrap_or_default();
@@ -161,13 +195,12 @@ fn collect_files(
 
     let map: Arc<Mutex<HashMap<PathBuf, (PathBuf, u64)>>> = Arc::new(Mutex::new(HashMap::new()));
 
-    // The `ignore` crate handles .gitignore, .ignore, global git excludes, etc.
     let walker = WalkBuilder::new(root)
-        .hidden(false)
+        .hidden(false) // we handle hidden ourselves
         .git_ignore(opts.use_gitignore)
         .git_global(false)
         .git_exclude(false)
-        .require_git(false) // honour .gitignore outside of git repos too
+        .require_git(false) // .gitignore works outside git repos too
         .ignore(opts.use_gitignore)
         .follow_links(true)
         .threads(rayon::current_num_threads().min(8))
@@ -188,15 +221,13 @@ fn collect_files(
                 Ok(e) => e,
                 Err(_) => return WalkState::Continue,
             };
-
             let path = entry.path();
 
-            // Skip VCS dirs always
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if is_always_skip(name) {
                     return WalkState::Skip;
                 }
-                // Skip hidden files/dirs (but not the root itself)
+                // Skip hidden (but not the root itself)
                 if name.starts_with('.') && path != root_ref {
                     return WalkState::Continue;
                 }
@@ -211,7 +242,7 @@ fn collect_files(
                 Err(_) => return WalkState::Continue,
             };
 
-            // User glob patterns
+            // User glob patterns (already split/parsed in build_globset)
             if globs_ref.is_match(&rel) {
                 return WalkState::Continue;
             }
@@ -225,12 +256,10 @@ fn collect_files(
         })
     });
 
-    let result = Arc::try_unwrap(map)
+    Ok(Arc::try_unwrap(map)
         .expect("arc still shared")
         .into_inner()
-        .expect("mutex poisoned");
-
-    Ok(result)
+        .expect("mutex poisoned"))
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -238,82 +267,84 @@ fn collect_files(
 pub fn compute_diff(old_root: &Path, new_root: &Path, opts: &DiffOptions) -> Result<DiffResult> {
     let globs = opts.build_globset()?;
 
-    // Collect file listings in parallel
-    let (old_files_res, new_files_res) = rayon::join(
+    // Collect both trees in parallel
+    let (old_res, new_res) = rayon::join(
         || collect_files(old_root, opts, &globs),
         || collect_files(new_root, opts, &globs),
     );
-    let old_files = old_files_res?;
-    let new_files = new_files_res?;
+    let old_files = old_res?;
+    let new_files = new_res?;
 
     let old_keys: HashSet<&PathBuf> = old_files.keys().collect();
     let new_keys: HashSet<&PathBuf> = new_files.keys().collect();
 
-    // Collect all work items
     let added_keys: Vec<&PathBuf> = new_keys.difference(&old_keys).copied().collect();
     let removed_keys: Vec<&PathBuf> = old_keys.difference(&new_keys).copied().collect();
     let common_keys: Vec<&PathBuf> = old_keys.intersection(&new_keys).copied().collect();
 
-    // Process added/removed (read binary flag only, no hashing needed)
+    // Added — only need a binary peek, no hashing
     let added: Vec<FileDiff> = added_keys
         .par_iter()
         .map(|key| {
             let (path, size) = &new_files[*key];
-            let bytes = fs::read(path).unwrap_or_default();
             FileDiff {
                 rel_path: (*key).clone(),
                 kind: ChangeKind::Added,
                 old_path: None,
                 new_path: Some(path.clone()),
-                is_binary: is_binary(&bytes),
+                is_binary: peek_binary(path),
                 old_size: None,
                 new_size: Some(*size),
             }
         })
         .collect();
 
+    // Removed — only need a binary peek, no hashing
     let removed: Vec<FileDiff> = removed_keys
         .par_iter()
         .map(|key| {
             let (path, size) = &old_files[*key];
-            let bytes = fs::read(path).unwrap_or_default();
             FileDiff {
                 rel_path: (*key).clone(),
                 kind: ChangeKind::Removed,
                 old_path: Some(path.clone()),
                 new_path: None,
-                is_binary: is_binary(&bytes),
+                is_binary: peek_binary(path),
                 old_size: Some(*size),
                 new_size: None,
             }
         })
         .collect();
 
-    // Process common files — hash both sides in parallel pairs
+    // Common — three-stage fast path:
+    //   1. sizes differ  → immediately Modified, skip hashing entirely
+    //   2. sizes equal   → hash both sides to confirm
+    //   3. hashes equal  → Unchanged
     let common: Vec<FileDiff> = common_keys
         .par_iter()
         .map(|key| {
             let (old_path, old_size) = &old_files[*key];
             let (new_path, new_size) = &new_files[*key];
 
-            // Quick size check — if sizes differ we know it's modified without full hash
-            let size_changed = old_size != new_size;
-
-            let (old_hash, new_hash) = if size_changed {
-                // Still hash to be sure (size can rarely be same after modification)
-                rayon::join(|| hash_file(old_path), || hash_file(new_path))
+            let kind = if old_size != new_size {
+                // Sizes differ → definitely modified, no I/O needed beyond what we have
+                ChangeKind::Modified
             } else {
-                rayon::join(|| hash_file(old_path), || hash_file(new_path))
+                // Sizes match → need to hash to be sure (identical size ≠ identical content)
+                let (old_hash, new_hash) =
+                    rayon::join(|| hash_file(old_path), || hash_file(new_path));
+                if old_hash == new_hash {
+                    ChangeKind::Unchanged
+                } else {
+                    ChangeKind::Modified
+                }
             };
 
-            // Detect binary from old side
-            let bytes_peek = fs::read(old_path).unwrap_or_default();
-            let binary = is_binary(&bytes_peek);
-
-            let kind = if old_hash == new_hash {
-                ChangeKind::Unchanged
+            // Only peek binary for changed files — unchanged ones rarely need it in the UI
+            let binary = if kind == ChangeKind::Unchanged {
+                false
             } else {
-                ChangeKind::Modified
+                peek_binary(old_path)
             };
 
             FileDiff {
@@ -328,7 +359,7 @@ pub fn compute_diff(old_root: &Path, new_root: &Path, opts: &DiffOptions) -> Res
         })
         .collect();
 
-    // Build stats
+    // Stats
     let mut stats = DiffStats {
         added: added.len(),
         removed: removed.len(),
@@ -342,7 +373,7 @@ pub fn compute_diff(old_root: &Path, new_root: &Path, opts: &DiffOptions) -> Res
         }
     }
 
-    // Merge and sort: modified → added → removed → unchanged
+    // Merge + sort: modified → added → removed → unchanged
     let mut files: Vec<FileDiff> = added.into_iter().chain(removed).chain(common).collect();
     files.sort_by(|a, b| {
         let order = |k: &ChangeKind| match k {
@@ -379,13 +410,13 @@ pub fn get_file_diff_lines(file: &FileDiff) -> Vec<DiffLine> {
 
     match &file.kind {
         ChangeKind::Added => {
-            if let Some(new_path) = &file.new_path {
-                let content = fs::read_to_string(new_path).unwrap_or_default();
+            if let Some(p) = &file.new_path {
+                let content = fs::read_to_string(p).unwrap_or_default();
                 let mut lines = vec![DiffLine {
                     tag: LineTag::Header,
                     old_lineno: None,
                     new_lineno: None,
-                    content: format!("  New file: {}", new_path.display()),
+                    content: format!("  New file: {}", p.display()),
                 }];
                 for (i, line) in content.lines().enumerate() {
                     lines.push(DiffLine {
@@ -399,13 +430,13 @@ pub fn get_file_diff_lines(file: &FileDiff) -> Vec<DiffLine> {
             }
         }
         ChangeKind::Removed => {
-            if let Some(old_path) = &file.old_path {
-                let content = fs::read_to_string(old_path).unwrap_or_default();
+            if let Some(p) = &file.old_path {
+                let content = fs::read_to_string(p).unwrap_or_default();
                 let mut lines = vec![DiffLine {
                     tag: LineTag::Header,
                     old_lineno: None,
                     new_lineno: None,
-                    content: format!("  Deleted file: {}", old_path.display()),
+                    content: format!("  Deleted file: {}", p.display()),
                 }];
                 for (i, line) in content.lines().enumerate() {
                     lines.push(DiffLine {
@@ -427,10 +458,10 @@ pub fn get_file_diff_lines(file: &FileDiff) -> Vec<DiffLine> {
             }];
         }
         ChangeKind::Modified => {
-            if let (Some(old_path), Some(new_path)) = (&file.old_path, &file.new_path) {
-                let old_content = fs::read_to_string(old_path).unwrap_or_default();
-                let new_content = fs::read_to_string(new_path).unwrap_or_default();
-                return build_diff_lines(&old_content, &new_content);
+            if let (Some(old_p), Some(new_p)) = (&file.old_path, &file.new_path) {
+                let old_c = fs::read_to_string(old_p).unwrap_or_default();
+                let new_c = fs::read_to_string(new_p).unwrap_or_default();
+                return build_diff_lines(&old_c, &new_c);
             }
         }
     }
@@ -451,6 +482,7 @@ fn build_diff_lines(old: &str, new: &str) -> Vec<DiffLine> {
         let new_start = first.new_range().start + 1;
         let old_end = last.old_range().end;
         let new_end = last.new_range().end;
+
         result.push(DiffLine {
             tag: LineTag::Header,
             old_lineno: None,
@@ -460,7 +492,7 @@ fn build_diff_lines(old: &str, new: &str) -> Vec<DiffLine> {
                 old_start,
                 old_end.saturating_sub(old_start - 1),
                 new_start,
-                new_end.saturating_sub(new_start - 1)
+                new_end.saturating_sub(new_start - 1),
             ),
         });
 

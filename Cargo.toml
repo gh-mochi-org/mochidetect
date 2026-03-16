@@ -10,6 +10,13 @@ license = "MIT"
 name = "mochidetect"
 path = "src/main.rs"
 
+[profile.release]
+strip = true
+lto = true
+panic = "abort"
+opt-level = "z"
+codegen-units = 1
+
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.6.0", features = ["derive", "color"] }
