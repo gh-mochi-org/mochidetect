@@ -23,17 +23,17 @@ pub enum ChangeKind {
 impl ChangeKind {
     pub fn symbol(&self) -> &str {
         match self {
-            ChangeKind::Added => "+",
-            ChangeKind::Removed => "-",
-            ChangeKind::Modified => "~",
+            ChangeKind::Added     => "+",
+            ChangeKind::Removed   => "-",
+            ChangeKind::Modified  => "~",
             ChangeKind::Unchanged => "=",
         }
     }
     pub fn label(&self) -> &str {
         match self {
-            ChangeKind::Added => "ADDED",
-            ChangeKind::Removed => "REMOVED",
-            ChangeKind::Modified => "MODIFIED",
+            ChangeKind::Added     => "ADDED",
+            ChangeKind::Removed   => "REMOVED",
+            ChangeKind::Modified  => "MODIFIED",
             ChangeKind::Unchanged => "UNCHANGED",
         }
     }
@@ -44,108 +44,84 @@ impl ChangeKind {
 
 #[derive(Debug, Clone)]
 pub struct FileDiff {
-    pub rel_path: PathBuf,
-    pub kind: ChangeKind,
-    pub old_path: Option<PathBuf>,
-    pub new_path: Option<PathBuf>,
+    pub rel_path:  PathBuf,
+    pub kind:      ChangeKind,
+    pub old_path:  Option<PathBuf>,
+    pub new_path:  Option<PathBuf>,
     pub is_binary: bool,
-    pub old_size: Option<u64>,
-    pub new_size: Option<u64>,
+    pub old_size:  Option<u64>,
+    pub new_size:  Option<u64>,
 }
 
 impl FileDiff {
     pub fn extension(&self) -> String {
-        self.rel_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase()
+        self.rel_path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase()
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct DiffLine {
-    pub tag: LineTag,
+    pub tag:        LineTag,
     pub old_lineno: Option<usize>,
     pub new_lineno: Option<usize>,
-    pub content: String,
+    pub content:    String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum LineTag {
-    Equal,
-    Insert,
-    Delete,
-    Header,
-}
+pub enum LineTag { Equal, Insert, Delete, Header }
 
 #[derive(Debug)]
 pub struct DiffResult {
     pub old_path: String,
     pub new_path: String,
-    pub files: Vec<FileDiff>,
-    pub stats: DiffStats,
-    pub skipped: usize,
+    pub files:    Vec<FileDiff>,
+    pub stats:    DiffStats,
+    pub skipped:  usize,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct DiffStats {
-    pub added: usize,
-    pub removed: usize,
-    pub modified: usize,
+    pub added:     usize,
+    pub removed:   usize,
+    pub modified:  usize,
     pub unchanged: usize,
 }
 
 impl DiffStats {
-    pub fn total_changes(&self) -> usize {
-        self.added + self.removed + self.modified
-    }
+    pub fn total_changes(&self) -> usize { self.added + self.removed + self.modified }
 }
-
-// ─── Streaming update type ────────────────────────────────────────────────────
 
 /// Messages streamed from the background diff thread to the TUI.
 pub enum DiffUpdate {
-    /// A single file result — arrives as soon as it's known.
+    /// A single file result — arrives as soon as it's computed.
     File(FileDiff),
-    /// All files have been processed. List is now complete.
+    /// All files have been processed — list is complete.
     Done,
     /// A fatal error occurred.
     Error(String),
+    /// Filesystem watcher detected a change — TUI should rescan.
+    WatchEvent,
 }
 
 // ─── Diff options ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default)]
 pub struct DiffOptions {
-    /// Extra ignore patterns — supports glob syntax and `|` separation.
-    /// e.g. "*.log", "dist/**", "*.log|*.lock|build/"
-    pub ignore_patterns: Vec<String>,
-    /// Whether to respect .gitignore / .ignore files
-    pub use_gitignore: bool,
+    /// Glob ignore patterns. Supports `|` and space separation.
+    pub ignore_patterns:    Vec<String>,
+    /// Respect .gitignore / .ignore files.
+    pub use_gitignore:      bool,
+    /// Treat files that differ only in whitespace as Unchanged.
+    pub ignore_whitespace:  bool,
 }
 
 impl DiffOptions {
     pub fn build_globset(&self) -> Result<GlobSet> {
         let mut builder = GlobSetBuilder::new();
         for raw in &self.ignore_patterns {
-            for pat in raw
-                .split(['|', ' ', '\t'])
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
+            for pat in raw.split(['|', ' ', '\t']).map(str::trim).filter(|s| !s.is_empty()) {
                 builder.add(Glob::new(pat)?);
-
-                // Auto-expand bare names (no `/` or `*`) so that e.g. "target"
-                // matches the directory itself AND everything inside it at any
-                // depth — same behaviour as .gitignore bare-name rules.
-                //
-                //   "target"  →  target/**      (contents of top-level target/)
-                //                **/target/**   (contents of nested target/)
-                //                **/target      (the dir node itself when nested)
-                //
-                // Patterns that already contain `/` or `*` are intentional glob
-                // expressions and are left untouched.
+                // Bare names (no / or *) → also match as directory prefix
                 if !pat.contains('/') && !pat.contains('*') {
                     builder.add(Glob::new(&format!("{}/**", pat))?);
                     builder.add(Glob::new(&format!("**/{}/**", pat))?);
@@ -159,35 +135,48 @@ impl DiffOptions {
 
 // ─── Fast I/O helpers ─────────────────────────────────────────────────────────
 
-/// Peek at the first 512 bytes to decide if it's binary — fast, avoids MB of I/O.
+/// Read first 512 bytes — fast binary check without loading the whole file.
 fn peek_binary(path: &Path) -> bool {
     let mut buf = [0u8; 512];
     match File::open(path) {
-        Ok(mut f) => {
-            let n = f.read(&mut buf).unwrap_or(0);
-            buf[..n].contains(&0)
-        }
-        Err(_) => false,
+        Ok(mut f) => { let n = f.read(&mut buf).unwrap_or(0); buf[..n].contains(&0) }
+        Err(_)    => false,
     }
 }
 
-/// SHA-256 hash a file in 64 KB chunks. Only called when sizes match.
+/// Hash a file in 64 KB chunks.
 fn hash_file(path: &Path) -> String {
     match File::open(path) {
         Ok(mut f) => {
-            let mut hasher = Sha256::new();
+            let mut h   = Sha256::new();
             let mut buf = [0u8; 65536];
             loop {
                 match f.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => hasher.update(&buf[..n]),
+                    Ok(0)  => break,
+                    Ok(n)  => h.update(&buf[..n]),
                     Err(_) => return String::new(),
                 }
             }
-            hex::encode(hasher.finalize())
+            hex::encode(h.finalize())
         }
         Err(_) => String::new(),
     }
+}
+
+/// Hash file content with trailing whitespace stripped per line.
+/// Used for --ignore-whitespace: two files that differ only in spacing
+/// will produce the same hash and be treated as Unchanged.
+fn hash_file_normalized(path: &Path) -> String {
+    let content = match fs::read_to_string(path) {
+        Ok(s)  => s,
+        Err(_) => return String::new(),
+    };
+    let mut h = Sha256::new();
+    for line in content.lines() {
+        h.update(line.trim_end().as_bytes());
+        h.update(b"\n");
+    }
+    hex::encode(h.finalize())
 }
 
 // ─── File collection ──────────────────────────────────────────────────────────
@@ -196,12 +185,9 @@ fn is_always_skip(name: &str) -> bool {
     matches!(name, ".git" | ".hg" | ".svn")
 }
 
-/// Walk a directory tree and return relative_path → (absolute_path, size).
-fn collect_files(
-    root: &Path,
-    opts: &DiffOptions,
-    globs: &GlobSet,
-) -> Result<HashMap<PathBuf, (PathBuf, u64)>> {
+fn collect_files(root: &Path, opts: &DiffOptions, globs: &GlobSet)
+    -> Result<HashMap<PathBuf, (PathBuf, u64)>>
+{
     if root.is_file() {
         let meta = fs::metadata(root)?;
         let filename = root.file_name().unwrap_or_default();
@@ -210,7 +196,8 @@ fn collect_files(
         return Ok(map);
     }
 
-    let map: Arc<Mutex<HashMap<PathBuf, (PathBuf, u64)>>> = Arc::new(Mutex::new(HashMap::new()));
+    let map: Arc<Mutex<HashMap<PathBuf, (PathBuf, u64)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     let walker = WalkBuilder::new(root)
         .hidden(false)
@@ -223,46 +210,33 @@ fn collect_files(
         .threads(rayon::current_num_threads().min(8))
         .build_parallel();
 
-    let map_clone = Arc::clone(&map);
-    let root_owned = root.to_path_buf();
+    let map_clone   = Arc::clone(&map);
+    let root_owned  = root.to_path_buf();
     let globs_clone = globs.clone();
 
     walker.run(move || {
-        let map_ref = Arc::clone(&map_clone);
-        let root_ref = root_owned.clone();
+        let map_ref   = Arc::clone(&map_clone);
+        let root_ref  = root_owned.clone();
         let globs_ref = globs_clone.clone();
 
         Box::new(move |entry_result| {
             use ignore::WalkState;
-            let entry = match entry_result {
-                Ok(e) => e,
-                Err(_) => return WalkState::Continue,
-            };
-            let path = entry.path();
-            let is_dir  = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            let is_file = entry.file_type().map(|t| t.is_file()).unwrap_or(false);
+            let entry = match entry_result { Ok(e) => e, Err(_) => return WalkState::Continue };
+            let path   = entry.path();
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let is_file= entry.file_type().map(|t| t.is_file()).unwrap_or(false);
 
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if is_always_skip(name) {
-                    return WalkState::Skip; // prune .git/.hg/.svn trees
-                }
+                if is_always_skip(name) { return WalkState::Skip; }
                 if name.starts_with('.') && path != root_ref {
-                    // Hidden dirs → prune whole subtree; hidden files → skip
                     return if is_dir { WalkState::Skip } else { WalkState::Continue };
                 }
             }
 
-            // ── For directories: check globs and prune whole subtree if matched.
-            // This is what makes `-I target` as fast as find's -prune — we never
-            // descend into ignored directories at all.
             if is_dir {
                 if let Ok(rel) = path.strip_prefix(&root_ref) {
-                    // Check relative path ("target", "src/target") or bare name
                     if globs_ref.is_match(rel)
-                        || path
-                            .file_name()
-                            .map(|n| globs_ref.is_match(n))
-                            .unwrap_or(false)
+                        || path.file_name().map(|n| globs_ref.is_match(n)).unwrap_or(false)
                     {
                         return WalkState::Skip;
                     }
@@ -270,39 +244,27 @@ fn collect_files(
                 return WalkState::Continue;
             }
 
-            if !is_file {
-                return WalkState::Continue;
-            }
+            if !is_file { return WalkState::Continue; }
 
             let rel = match path.strip_prefix(&root_ref) {
-                Ok(r) => r.to_path_buf(),
+                Ok(r)  => r.to_path_buf(),
                 Err(_) => return WalkState::Continue,
             };
-
-            if globs_ref.is_match(&rel) {
-                return WalkState::Continue;
-            }
+            if globs_ref.is_match(&rel) { return WalkState::Continue; }
 
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            map_ref
-                .lock()
-                .unwrap()
-                .insert(rel, (path.to_path_buf(), size));
+            map_ref.lock().unwrap().insert(rel, (path.to_path_buf(), size));
             WalkState::Continue
         })
     });
 
-    Ok(Arc::try_unwrap(map)
-        .expect("arc still shared")
-        .into_inner()
-        .expect("mutex poisoned"))
+    Ok(Arc::try_unwrap(map).expect("arc").into_inner().expect("mutex"))
 }
 
-// ─── Synchronous API (used by --plain / --summary) ───────────────────────────
+// ─── Sync API (--plain / --summary) ──────────────────────────────────────────
 
 pub fn compute_diff(old_root: &Path, new_root: &Path, opts: &DiffOptions) -> Result<DiffResult> {
     let globs = opts.build_globset()?;
-
     let (old_res, new_res) = rayon::join(
         || collect_files(old_root, opts, &globs),
         || collect_files(new_root, opts, &globs),
@@ -313,123 +275,40 @@ pub fn compute_diff(old_root: &Path, new_root: &Path, opts: &DiffOptions) -> Res
     let old_keys: HashSet<&PathBuf> = old_files.keys().collect();
     let new_keys: HashSet<&PathBuf> = new_files.keys().collect();
 
-    let added_keys: Vec<&PathBuf> = new_keys.difference(&old_keys).copied().collect();
+    let added_keys:   Vec<&PathBuf> = new_keys.difference(&old_keys).copied().collect();
     let removed_keys: Vec<&PathBuf> = old_keys.difference(&new_keys).copied().collect();
-    let common_keys: Vec<&PathBuf> = old_keys.intersection(&new_keys).copied().collect();
+    let common_keys:  Vec<&PathBuf> = old_keys.intersection(&new_keys).copied().collect();
 
-    let added: Vec<FileDiff> = added_keys
-        .par_iter()
-        .map(|key| {
-            let (path, size) = &new_files[*key];
-            FileDiff {
-                rel_path: (*key).clone(),
-                kind: ChangeKind::Added,
-                old_path: None,
-                new_path: Some(path.clone()),
-                is_binary: peek_binary(path),
-                old_size: None,
-                new_size: Some(*size),
-            }
-        })
-        .collect();
+    let added: Vec<FileDiff> = added_keys.par_iter().map(|key| {
+        let (path, size) = &new_files[*key];
+        FileDiff { rel_path: (*key).clone(), kind: ChangeKind::Added,
+            old_path: None, new_path: Some(path.clone()),
+            is_binary: peek_binary(path), old_size: None, new_size: Some(*size) }
+    }).collect();
 
-    let removed: Vec<FileDiff> = removed_keys
-        .par_iter()
-        .map(|key| {
-            let (path, size) = &old_files[*key];
-            FileDiff {
-                rel_path: (*key).clone(),
-                kind: ChangeKind::Removed,
-                old_path: Some(path.clone()),
-                new_path: None,
-                is_binary: peek_binary(path),
-                old_size: Some(*size),
-                new_size: None,
-            }
-        })
-        .collect();
+    let removed: Vec<FileDiff> = removed_keys.par_iter().map(|key| {
+        let (path, size) = &old_files[*key];
+        FileDiff { rel_path: (*key).clone(), kind: ChangeKind::Removed,
+            old_path: Some(path.clone()), new_path: None,
+            is_binary: peek_binary(path), old_size: Some(*size), new_size: None }
+    }).collect();
 
-    let common: Vec<FileDiff> = common_keys
-        .par_iter()
-        .map(|key| {
-            let (old_path, old_size) = &old_files[*key];
-            let (new_path, new_size) = &new_files[*key];
+    let common: Vec<FileDiff> = common_keys.par_iter().map(|key| {
+        classify_common(key, &old_files, &new_files, opts)
+    }).collect();
 
-            let kind = if old_size != new_size {
-                ChangeKind::Modified
-            } else {
-                let (old_hash, new_hash) =
-                    rayon::join(|| hash_file(old_path), || hash_file(new_path));
-                if old_hash == new_hash {
-                    ChangeKind::Unchanged
-                } else {
-                    ChangeKind::Modified
-                }
-            };
-
-            let binary = if kind == ChangeKind::Unchanged {
-                false
-            } else {
-                peek_binary(old_path)
-            };
-
-            FileDiff {
-                rel_path: (*key).clone(),
-                kind,
-                old_path: Some(old_path.clone()),
-                new_path: Some(new_path.clone()),
-                is_binary: binary,
-                old_size: Some(*old_size),
-                new_size: Some(*new_size),
-            }
-        })
-        .collect();
-
-    let mut stats = DiffStats {
-        added: added.len(),
-        removed: removed.len(),
-        ..Default::default()
-    };
+    let mut stats = DiffStats { added: added.len(), removed: removed.len(), ..Default::default() };
     for f in &common {
-        match f.kind {
-            ChangeKind::Modified => stats.modified += 1,
-            ChangeKind::Unchanged => stats.unchanged += 1,
-            _ => {}
-        }
+        match f.kind { ChangeKind::Modified => stats.modified += 1, ChangeKind::Unchanged => stats.unchanged += 1, _ => {} }
     }
 
     let mut files: Vec<FileDiff> = added.into_iter().chain(removed).chain(common).collect();
-    files.sort_by(|a, b| {
-        let order = |k: &ChangeKind| match k {
-            ChangeKind::Modified => 0,
-            ChangeKind::Added => 1,
-            ChangeKind::Removed => 2,
-            ChangeKind::Unchanged => 3,
-        };
-        order(&a.kind)
-            .cmp(&order(&b.kind))
-            .then_with(|| a.rel_path.cmp(&b.rel_path))
-    });
+    sort_files(&mut files);
 
-    Ok(DiffResult {
-        old_path: old_root.display().to_string(),
-        new_path: new_root.display().to_string(),
-        skipped: 0,
-        files,
-        stats,
-    })
+    Ok(DiffResult { old_path: old_root.display().to_string(), new_path: new_root.display().to_string(), skipped: 0, files, stats })
 }
 
-// ─── Streaming / async API (used by TUI) ─────────────────────────────────────
-//
-// Strategy:
-//   1. Walk both trees in parallel (fast — just filesystem metadata, no I/O)
-//   2. Added/Removed are known immediately → sent right away
-//   3. Common files are hashed in parallel via rayon → each result sent the
-//      moment it's ready, so the TUI fills up live instead of all at once
-//
-// This means the TUI opens instantly, shows added/removed files within
-// milliseconds, and modified/unchanged trickle in as SHA-256 completes.
+// ─── Streaming async API (TUI) ────────────────────────────────────────────────
 
 pub fn compute_diff_async(
     old_root: PathBuf,
@@ -439,153 +318,120 @@ pub fn compute_diff_async(
 ) {
     let globs = match opts.build_globset() {
         Ok(g) => g,
-        Err(e) => {
-            tx.send(DiffUpdate::Error(e.to_string())).ok();
-            return;
-        }
+        Err(e) => { tx.send(DiffUpdate::Error(e.to_string())).ok(); return; }
     };
 
-    // ── Phase 1: parallel filesystem walk (metadata only, very fast) ─────────
     let (old_res, new_res) = rayon::join(
         || collect_files(&old_root, &opts, &globs),
         || collect_files(&new_root, &opts, &globs),
     );
 
-    let old_files = match old_res {
-        Ok(m) => Arc::new(m),
-        Err(e) => {
-            tx.send(DiffUpdate::Error(e.to_string())).ok();
-            return;
-        }
-    };
-    let new_files = match new_res {
-        Ok(m) => Arc::new(m),
-        Err(e) => {
-            tx.send(DiffUpdate::Error(e.to_string())).ok();
-            return;
-        }
-    };
+    let old_files = Arc::new(match old_res { Ok(m) => m, Err(e) => { tx.send(DiffUpdate::Error(e.to_string())).ok(); return; } });
+    let new_files = Arc::new(match new_res { Ok(m) => m, Err(e) => { tx.send(DiffUpdate::Error(e.to_string())).ok(); return; } });
 
     let old_set: HashSet<PathBuf> = old_files.keys().cloned().collect();
     let new_set: HashSet<PathBuf> = new_files.keys().cloned().collect();
 
-    let added_keys: Vec<PathBuf> = new_set.difference(&old_set).cloned().collect();
+    let added_keys:   Vec<PathBuf> = new_set.difference(&old_set).cloned().collect();
     let removed_keys: Vec<PathBuf> = old_set.difference(&new_set).cloned().collect();
-    let common_keys: Vec<PathBuf> = old_set.intersection(&new_set).cloned().collect();
+    let common_keys:  Vec<PathBuf> = old_set.intersection(&new_set).cloned().collect();
 
-    // ── Phase 2: send Added immediately (no hashing needed) ──────────────────
+    // Phase 1 — Added/Removed: no hashing, send immediately
     for key in added_keys {
         let (path, size) = &new_files[&key];
-        let file = FileDiff {
-            is_binary: peek_binary(path),
-            rel_path: key,
-            kind: ChangeKind::Added,
-            old_path: None,
-            new_path: Some(path.clone()),
-            old_size: None,
-            new_size: Some(*size),
-        };
-        if tx.send(DiffUpdate::File(file)).is_err() {
-            return; // TUI closed
-        }
+        if tx.send(DiffUpdate::File(FileDiff {
+            rel_path: key, kind: ChangeKind::Added,
+            old_path: None, new_path: Some(path.clone()),
+            is_binary: peek_binary(path), old_size: None, new_size: Some(*size),
+        })).is_err() { return; }
     }
-
-    // ── Phase 2: send Removed immediately (no hashing needed) ────────────────
     for key in removed_keys {
         let (path, size) = &old_files[&key];
-        let file = FileDiff {
-            is_binary: peek_binary(path),
-            rel_path: key,
-            kind: ChangeKind::Removed,
-            old_path: Some(path.clone()),
-            new_path: None,
-            old_size: Some(*size),
-            new_size: None,
-        };
-        if tx.send(DiffUpdate::File(file)).is_err() {
-            return;
-        }
+        if tx.send(DiffUpdate::File(FileDiff {
+            rel_path: key, kind: ChangeKind::Removed,
+            old_path: Some(path.clone()), new_path: None,
+            is_binary: peek_binary(path), old_size: Some(*size), new_size: None,
+        })).is_err() { return; }
     }
 
-    // ── Phase 3: hash common files in parallel, stream each result live ───────
-    // Clone tx before for_each_with consumes it, so we can send Done afterward.
+    // Phase 2 — Common: hash in parallel, stream each result the moment it's ready
     let tx_done = tx.clone();
     let of = Arc::clone(&old_files);
     let nf = Arc::clone(&new_files);
 
-    common_keys
-        .into_par_iter()
-        .for_each_with(tx, move |tx, key| {
-            let (old_path, old_size) = match of.get(&key) {
-                Some(v) => v,
-                None => return,
-            };
-            let (new_path, new_size) = match nf.get(&key) {
-                Some(v) => v,
-                None => return,
-            };
+    common_keys.into_par_iter().for_each_with(tx, move |tx, key| {
+        let file = classify_common(&key, &of, &nf, &opts);
+        tx.send(DiffUpdate::File(file)).ok();
+    });
 
-            let kind = if old_size != new_size {
-                // Size mismatch → definitely modified, skip hashing entirely
-                ChangeKind::Modified
-            } else {
-                let old_hash = hash_file(old_path);
-                let new_hash = hash_file(new_path);
-                if old_hash == new_hash {
-                    ChangeKind::Unchanged
-                } else {
-                    ChangeKind::Modified
-                }
-            };
-
-            // Only peek binary for changed files — unchanged ones rarely need it
-            let binary = kind != ChangeKind::Unchanged && peek_binary(old_path);
-
-            tx.send(DiffUpdate::File(FileDiff {
-                rel_path: key,
-                kind,
-                old_path: Some(old_path.clone()),
-                new_path: Some(new_path.clone()),
-                is_binary: binary,
-                old_size: Some(*old_size),
-                new_size: Some(*new_size),
-            }))
-            .ok();
-        });
-
-    // All workers finished — signal done
     tx_done.send(DiffUpdate::Done).ok();
 }
 
-// ─── Diff line rendering (lazy, reads from disk on demand) ───────────────────
+// ─── Shared classification logic ──────────────────────────────────────────────
+
+fn classify_common(
+    key: &PathBuf,
+    old_files: &HashMap<PathBuf, (PathBuf, u64)>,
+    new_files:  &HashMap<PathBuf, (PathBuf, u64)>,
+    opts: &DiffOptions,
+) -> FileDiff {
+    let (old_path, old_size) = &old_files[key];
+    let (new_path, new_size) = &new_files[key];
+
+    let kind = if old_size != new_size && !opts.ignore_whitespace {
+        // Sizes differ → definitely modified (skip hashing unless whitespace mode)
+        ChangeKind::Modified
+    } else {
+        // Same size OR whitespace mode → must compare content
+        let (old_hash, new_hash) = if opts.ignore_whitespace {
+            rayon::join(|| hash_file_normalized(old_path), || hash_file_normalized(new_path))
+        } else {
+            rayon::join(|| hash_file(old_path), || hash_file(new_path))
+        };
+        if old_hash == new_hash { ChangeKind::Unchanged } else { ChangeKind::Modified }
+    };
+
+    // Only peek binary for changed files
+    let binary = kind != ChangeKind::Unchanged && peek_binary(old_path);
+
+    FileDiff {
+        rel_path:  key.clone(),
+        kind,
+        old_path:  Some(old_path.clone()),
+        new_path:  Some(new_path.clone()),
+        is_binary: binary,
+        old_size:  Some(*old_size),
+        new_size:  Some(*new_size),
+    }
+}
+
+fn sort_files(files: &mut Vec<FileDiff>) {
+    files.sort_by(|a, b| {
+        let order = |k: &ChangeKind| match k {
+            ChangeKind::Modified  => 0u8,
+            ChangeKind::Added     => 1,
+            ChangeKind::Removed   => 2,
+            ChangeKind::Unchanged => 3,
+        };
+        order(&a.kind).cmp(&order(&b.kind)).then_with(|| a.rel_path.cmp(&b.rel_path))
+    });
+}
+
+// ─── Diff line rendering (lazy — reads from disk only when file is selected) ──
 
 pub fn get_file_diff_lines(file: &FileDiff) -> Vec<DiffLine> {
     if file.is_binary {
-        return vec![DiffLine {
-            tag: LineTag::Header,
-            old_lineno: None,
-            new_lineno: None,
-            content: "  Binary file — cannot show text diff".to_string(),
-        }];
+        return vec![DiffLine { tag: LineTag::Header, old_lineno: None, new_lineno: None,
+            content: "  Binary file — cannot show text diff".to_string() }];
     }
-
     match &file.kind {
         ChangeKind::Added => {
             if let Some(p) = &file.new_path {
                 let content = fs::read_to_string(p).unwrap_or_default();
-                let mut lines = vec![DiffLine {
-                    tag: LineTag::Header,
-                    old_lineno: None,
-                    new_lineno: None,
-                    content: format!("  New file: {}", p.display()),
-                }];
+                let mut lines = vec![DiffLine { tag: LineTag::Header, old_lineno: None,
+                    new_lineno: None, content: format!("  New file: {}", p.display()) }];
                 for (i, line) in content.lines().enumerate() {
-                    lines.push(DiffLine {
-                        tag: LineTag::Insert,
-                        old_lineno: None,
-                        new_lineno: Some(i + 1),
-                        content: line.to_string(),
-                    });
+                    lines.push(DiffLine { tag: LineTag::Insert, old_lineno: None, new_lineno: Some(i + 1), content: line.to_string() });
                 }
                 return lines;
             }
@@ -593,115 +439,67 @@ pub fn get_file_diff_lines(file: &FileDiff) -> Vec<DiffLine> {
         ChangeKind::Removed => {
             if let Some(p) = &file.old_path {
                 let content = fs::read_to_string(p).unwrap_or_default();
-                let mut lines = vec![DiffLine {
-                    tag: LineTag::Header,
-                    old_lineno: None,
-                    new_lineno: None,
-                    content: format!("  Deleted file: {}", p.display()),
-                }];
+                let mut lines = vec![DiffLine { tag: LineTag::Header, old_lineno: None,
+                    new_lineno: None, content: format!("  Deleted file: {}", p.display()) }];
                 for (i, line) in content.lines().enumerate() {
-                    lines.push(DiffLine {
-                        tag: LineTag::Delete,
-                        old_lineno: Some(i + 1),
-                        new_lineno: None,
-                        content: line.to_string(),
-                    });
+                    lines.push(DiffLine { tag: LineTag::Delete, old_lineno: Some(i + 1), new_lineno: None, content: line.to_string() });
                 }
                 return lines;
             }
         }
         ChangeKind::Unchanged => {
-            return vec![DiffLine {
-                tag: LineTag::Header,
-                old_lineno: None,
-                new_lineno: None,
-                content: "  No changes in this file.".to_string(),
-            }];
+            return vec![DiffLine { tag: LineTag::Header, old_lineno: None, new_lineno: None,
+                content: "  No changes in this file.".to_string() }];
         }
         ChangeKind::Modified => {
-            if let (Some(old_p), Some(new_p)) = (&file.old_path, &file.new_path) {
-                let old_c = fs::read_to_string(old_p).unwrap_or_default();
-                let new_c = fs::read_to_string(new_p).unwrap_or_default();
-                return build_diff_lines(&old_c, &new_c);
+            if let (Some(op), Some(np)) = (&file.old_path, &file.new_path) {
+                return build_diff_lines(
+                    &fs::read_to_string(op).unwrap_or_default(),
+                    &fs::read_to_string(np).unwrap_or_default(),
+                );
             }
         }
     }
-
     vec![]
 }
 
 fn build_diff_lines(old: &str, new: &str) -> Vec<DiffLine> {
     let diff = TextDiff::from_lines(old, new);
     let mut result = Vec::new();
-    let mut old_lineno = 0usize;
-    let mut new_lineno = 0usize;
+    let mut old_no = 0usize;
+    let mut new_no = 0usize;
 
     for group in diff.grouped_ops(3) {
         let first = group.first().unwrap();
-        let last = group.last().unwrap();
-        let old_start = first.old_range().start + 1;
-        let new_start = first.new_range().start + 1;
-        let old_end = last.old_range().end;
-        let new_end = last.new_range().end;
-
-        result.push(DiffLine {
-            tag: LineTag::Header,
-            old_lineno: None,
-            new_lineno: None,
-            content: format!(
-                "@@ -{},{} +{},{} @@",
-                old_start,
-                old_end.saturating_sub(old_start - 1),
-                new_start,
-                new_end.saturating_sub(new_start - 1),
-            ),
-        });
+        let last  = group.last().unwrap();
+        let os = first.old_range().start + 1;
+        let ns = first.new_range().start + 1;
+        let oe = last.old_range().end;
+        let ne = last.new_range().end;
+        result.push(DiffLine { tag: LineTag::Header, old_lineno: None, new_lineno: None,
+            content: format!("@@ -{},{} +{},{} @@", os, oe.saturating_sub(os-1), ns, ne.saturating_sub(ns-1)) });
 
         for op in &group {
             for change in diff.iter_changes(op) {
                 let tag = match change.tag() {
-                    ChangeTag::Delete => {
-                        old_lineno += 1;
-                        LineTag::Delete
-                    }
-                    ChangeTag::Insert => {
-                        new_lineno += 1;
-                        LineTag::Insert
-                    }
-                    ChangeTag::Equal => {
-                        old_lineno += 1;
-                        new_lineno += 1;
-                        LineTag::Equal
-                    }
+                    ChangeTag::Delete => { old_no += 1; LineTag::Delete }
+                    ChangeTag::Insert => { new_no += 1; LineTag::Insert }
+                    ChangeTag::Equal  => { old_no += 1; new_no += 1; LineTag::Equal }
                 };
                 let content = change.value().trim_end_matches('\n').to_string();
                 result.push(DiffLine {
-                    old_lineno: if tag == LineTag::Insert {
-                        None
-                    } else {
-                        Some(old_lineno)
-                    },
-                    new_lineno: if tag == LineTag::Delete {
-                        None
-                    } else {
-                        Some(new_lineno)
-                    },
-                    tag,
-                    content,
+                    old_lineno: if tag == LineTag::Insert { None } else { Some(old_no) },
+                    new_lineno: if tag == LineTag::Delete { None } else { Some(new_no) },
+                    tag, content,
                 });
             }
         }
     }
 
     if result.is_empty() {
-        result.push(DiffLine {
-            tag: LineTag::Header,
-            old_lineno: None,
-            new_lineno: None,
-            content: "  (no textual changes detected)".to_string(),
-        });
+        result.push(DiffLine { tag: LineTag::Header, old_lineno: None, new_lineno: None,
+            content: "  (no textual changes detected)".to_string() });
     }
-
     result
 }
 
