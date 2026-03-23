@@ -4,6 +4,7 @@ mod tui;
 use anyhow::{Context, Result};
 use clap::Parser;
 use diff::{ChangeKind, DiffOptions, DiffResult, DiffUpdate, compute_diff, compute_diff_async};
+use notify::event::{EventKind, ModifyKind};
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
@@ -166,6 +167,17 @@ fn run_watcher(
             noisy || in_git
         });
         if is_noise {
+            continue;
+        }
+
+        let is_meaningful = matches!(
+            event.kind,
+            EventKind::Create(_)
+                | EventKind::Remove(_)
+                | EventKind::Modify(ModifyKind::Data(_))
+                | EventKind::Modify(ModifyKind::Name(_))
+        );
+        if !is_meaningful {
             continue;
         }
 

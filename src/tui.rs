@@ -123,15 +123,16 @@ impl App {
     // ── Channel drain ─────────────────────────────────────────────────────────
 
     fn poll_updates(&mut self) -> bool {
-        // Clear timed-out status messages
+        let mut changed = false;
+
         if let Some(until) = self.status_until {
             if Instant::now() > until {
                 self.status_msg = None;
                 self.status_until = None;
+                changed = true;
             }
         }
 
-        let mut changed = false;
         loop {
             match self.rx.try_recv() {
                 Ok(DiffUpdate::File(f)) => {
